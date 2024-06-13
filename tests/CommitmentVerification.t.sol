@@ -23,8 +23,6 @@ import {IRiscZeroVerifier} from "risc0/IRiscZeroVerifier.sol";
 import {CommitmentVerification} from "../contracts/CommitmentVerification.sol";
 import {Elf} from "./Elf.sol"; // auto-generated contract after running `cargo build`.
 
-import { Sha2Ext } from "./Sha2Ext.sol";
-
 contract CommitmentVerificationTest is RiscZeroCheats, Test {
     CommitmentVerification public commitmentVerification;
 
@@ -46,47 +44,8 @@ contract CommitmentVerificationTest is RiscZeroCheats, Test {
 
     }
 
-    function test_works() public {
-        //bytes memory leafData = "example leaf data";
-        //(bytes32 b1, bytes16 b2) = Sha2Ext.sha384(leafData);
-        //bytes memory leaf = abi.encode(b1, b2);
-        //console2.logBytes(leaf);
-        //48 bytes sha384 of b"example leaf data"
-
-        // bytes[] memory merklePath = new bytes[](32);
-        // for (uint256 i = 0; i < 32; i++) {
-        //     bytes memory element = new bytes(48);
-        //     assembly {
-        //         mstore(add(add(element, 48), 0), i) // Store index value at the beginning of the bytes element
-        //     }
-        //     merklePath[i] = element;
-        //     input = bytes.concat(input, merklePath[i]);
-        // }
-
-        
-        //Values taken from methods/receipt.json after running the "cargo test" proof generation pipeline
-        // (bytes memory computedMerkleRoot, bytes memory computedLeaf, bytes memory computedPubkey, bytes memory computedSignature) = abi.decode(journal, (bytes, bytes, bytes, bytes));
-
-        // require(compareBytes(computedMerkleRoot, merkleRoot), "merkle roots don't match");
-
-        // require(compareBytes(computedLeaf, leaf), "leaf doesn't match");
-
-        // require(compareBytes(computedPubkey, blsPubKey), "pubKey doesn't match");
-
-        // require(compareBytes(computedSignature, blsSignature), "signature doesn't match");
+    function test_success() public {
 
         commitmentVerification.verify(journal, post_state_digest, seal);
     }
-}
-
-function compareBytes(bytes memory a, bytes memory b) pure returns (bool) {
-    if(a.length != b.length) {
-        return false;
-    }
-    for(uint i=0; i<a.length; i++) {
-        if(a[i] != b[i]) {
-            return false;
-        }
-    }
-    return true;
 }

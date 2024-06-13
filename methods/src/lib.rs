@@ -3,236 +3,83 @@ include!(concat!(env!("OUT_DIR"), "/methods.rs"));
 #[cfg(test)]
 mod tests {
 
-    use risc0_zkvm::{
-        compute_image_id, default_executor, default_prover, serde::to_vec, ExecutorEnv, Receipt,
-    };
+    use risc0_zkvm::{default_executor, ExecutorEnv, default_prover};
 
-    use bytemuck::cast_slice;
+    use sha3::{Keccak256, Digest};
+    use sha2::{Sha256};
 
-    use sha2::{Digest, Sha384};
+    use anyhow::Result;
 
-    use anyhow::{Context, Result};
-    use ethers::abi::Token;
-    use std::io::Write;
+    use ed25519_dalek::{Signature, Signer, SigningKey};
+    use rand::rngs::OsRng;
 
-    use alloy_primitives::FixedBytes;
-    use risc0_ethereum_contracts::groth16::Seal;
-    use std::time::Duration;
-
-    use bonsai_sdk::alpha as bonsai_sdk;
-
-    use crate::{MAIN_ELF, MAIN_ID};
-
-    use ark_bn254::{Fr as ScalarField, G1Projective, G2Projective};
-    use ark_ec::Group;
-    use ark_ff::{Field, PrimeField};
-    use ark_serialize::*;
-    use ark_std::UniformRand;
-
-    fn compute_merkle_root(leaf: &Vec<u8>, merkle_path: &Vec<Vec<u8>>) -> Vec<u8> {
-        let mut current_hash: Vec<u8> = Sha384::digest(leaf).to_vec();
-
-        for sibling in merkle_path {
-            let mut hasher = Sha384::new();
-            if current_hash < *sibling {
-                hasher.update(&current_hash);
-                hasher.update(&sibling);
-            } else {
-                hasher.update(&sibling);
-                hasher.update(&current_hash);
-            }
-            current_hash = hasher.finalize().to_vec();
+    fn versioned_hash(data: Vec<Vec<u8>>) -> Vec<u8> {
+        let mut hasher = Sha256::new();
+    
+        // Iterate over the vector of vectors, updating the hash for each inner vector
+        for bytes in data {
+            hasher.update(bytes);
         }
-
-        current_hash
-    }
-
-    fn run_bonsai(
-        signature_input: (Vec<u8>, Vec<u8>, Vec<u8>),
-        leaf_hash: Vec<u8>,
-        merkle_path: Vec<Vec<u8>>,
-    ) -> Result<(Vec<u8>, FixedBytes<32>, Vec<u8>), anyhow::Error> {
-        let client = bonsai_sdk::Client::from_env(risc0_zkvm::VERSION)?;
-
-        // Compute the image_id, then upload the ELF with the image_id as its key.
-        // let image_id = hex::encode(compute_image_id(MAIN_ELF)?);
-        let image_id = compute_image_id(MAIN_ELF).unwrap().to_string();
-        tracing::info!("image_id: {}", image_id);
-        client.upload_img(&image_id, MAIN_ELF.to_vec())?;
-
-        // Prepare input data and upload it.
-        // let input_data = to_vec(&signature_input).unwrap();
-        let mut input_data: Vec<u8> = Vec::new();
-        input_data.extend_from_slice(cast_slice(&to_vec(&signature_input)?));
-        input_data.extend_from_slice(cast_slice(&to_vec(&leaf_hash)?));
-        input_data.extend_from_slice(cast_slice(&to_vec(&merkle_path)?));
-
-        let input_id = client.upload_input(input_data)?;
-        tracing::info!("uploaded input");
-        // Add a list of assumptions
-        let assumptions: Vec<String> = vec![];
-
-        // Start a session running the prover
-        let session = client.create_session(image_id, input_id, assumptions)?;
-        loop {
-            let res = session.status(&client)?;
-            if res.status == "RUNNING" {
-                tracing::info!(
-                    "Current status: {} - state: {} - continue polling...",
-                    res.status,
-                    res.state.unwrap_or_default()
-                );
-                std::thread::sleep(Duration::from_secs(15));
-                continue;
-            }
-            if res.status == "SUCCEEDED" {
-                // Download the receipt, containing the output
-                let receipt_url = res
-                    .receipt_url
-                    .expect("API error, missing receipt on completed session");
-
-                let receipt_buf = client.download(&receipt_url)?;
-                let receipt: Receipt = bincode::deserialize(&receipt_buf)?;
-                receipt
-                    .verify(MAIN_ID)
-                    .expect("Receipt verification failed");
-            } else {
-                panic!(
-                    "Workflow exited: {} - | err: {}",
-                    res.status,
-                    res.error_msg.unwrap_or_default()
-                );
-            }
-
-            break;
+    
+        // Finalize the hash
+        let mut result = hasher.finalize().to_vec();
+    
+        // Modify the first byte of the hash
+        if !result.is_empty() {
+            result[0] = 0x01;
         }
-
-        // Optionally run stark2snark
-        tracing::info!("Running stark2snark...");
-
-        Ok(run_stark2snark(session.uuid)?)
-    }
-
-    fn run_stark2snark(
-        session_id: String,
-    ) -> Result<(Vec<u8>, FixedBytes<32>, Vec<u8>), anyhow::Error> {
-        let client = bonsai_sdk::Client::from_env(risc0_zkvm::VERSION)?;
-
-        let snark_session = client.create_snark(session_id)?;
-        tracing::info!("Created snark session: {}", snark_session.uuid);
-        let snark_receipt = loop {
-            let res = snark_session.status(&client)?;
-            match res.status.as_str() {
-                "RUNNING" => {
-                    tracing::info!("Current status: {} - continue polling...", res.status,);
-                    std::thread::sleep(Duration::from_secs(15));
-                    continue;
-                }
-                "SUCCEEDED" => {
-                    break res.output.context("No snark generated :(")?;
-                }
-                _ => {
-                    panic!(
-                        "Workflow exited: {} err: {}",
-                        res.status,
-                        res.error_msg.unwrap_or_default()
-                    );
-                }
-            }
-        };
-
-        let snark = snark_receipt.snark;
-        tracing::debug!("Snark proof!: {snark:?}");
-
-        let seal = Seal::abi_encode(snark).context("Read seal")?;
-        let post_state_digest: FixedBytes<32> = snark_receipt
-            .post_state_digest
-            .as_slice()
-            .try_into()
-            .context("Read post_state_digest")?;
-        let journal = snark_receipt.journal;
-
-        Ok((journal, post_state_digest, seal))
+    
+        result
     }
 
     #[test]
-    fn test_verify() -> Result<(), anyhow::Error> {
+    fn test_execute_success() -> Result<(), anyhow::Error> {
         tracing_subscriber::fmt()
             .with_max_level(tracing::Level::INFO)
             .with_target(false)
-            .init();
+            .init();        
 
-        // Precomputed example inputs
-        let leaf_data = b"example leaf data";
-        let leaf_hash: Vec<u8> = Sha384::digest(leaf_data).to_vec();
-
-        let mut merkle_path: Vec<Vec<u8>> = vec![vec![0; 48]; 32];
-        // Fill merkle_path with values from 0 to 31
-        for i in 0..32 {
-            merkle_path[i][47] = i as u8;
+        let mut blob: Vec<Vec<u8>> = Vec::new();
+        // for mock purposes transactions are exactly 32 bytes long and 4096 transactions fit in a blob
+        for i in 0..4096 {
+            let tx: Vec<u8> = vec![i as u8; 32];
+            blob.push(tx);
         }
+    
+        let versioned_hash: Vec<u8> = versioned_hash(blob.clone());
 
-        let computed_root: Vec<u8> = compute_merkle_root(&leaf_hash, &merkle_path);
-
-        tracing::info!("computed_root: {:x?}", computed_root);
-        tracing::info!("leaf_hash: {:x?}", leaf_hash);
-        tracing::info!("merkle_path: {:x?}", merkle_path);
-
-        let g2_gen: G2Projective = G2Projective::generator();
-        let g1_gen: G1Projective = G1Projective::generator();
-
-        let field_element_from_hash =
-            ScalarField::from_le_bytes_mod_order(computed_root.as_slice());
-
-        let message: G1Projective = g1_gen * field_element_from_hash;
-        let mut rng = ark_std::test_rng();
-        let s1 = ScalarField::rand(&mut rng);
-
-        let pubkey: G2Projective = g2_gen * s1;
-        let signature: G1Projective = message * s1;
-
-        let mut pubkey_bytes: Vec<u8> = Vec::new();
-        pubkey.serialize_compressed(&mut pubkey_bytes).unwrap();
-        tracing::info!("pubkey: {:x?}", pubkey_bytes);
-
-        let mut signature_bytes: Vec<u8> = Vec::new();
-        signature
-            .serialize_compressed(&mut signature_bytes)
-            .unwrap();
-        tracing::info!("signature: {:x?}", signature_bytes);
-
-        let signature_input = (pubkey_bytes, computed_root, signature_bytes);
-
+        let tx_non_existent: Vec<u8> = vec![0; 64]; // mock. will not result in the same hash as any of the above since the length is different
+    
+        let block_number: u32 = 1234; // mock
+    
+        let mut hasher = Keccak256::new();
+        hasher.update(&tx_non_existent);
+        let tx_hash: Vec<u8> = hasher.finalize().to_vec();
+    
+        let mut hasher2 = Keccak256::new();
+        hasher2.update(&tx_hash);
+        hasher2.update(&block_number.to_le_bytes());
+        let commitment: Vec<u8> = hasher2.finalize().to_vec();
+    
+        let mut csprng = OsRng {};
+        let keypair: SigningKey = SigningKey::generate(&mut csprng);
+        let signature: Signature = keypair.sign(&commitment);
+    
+        // tracing::info!("env");
+        let vk = keypair.verifying_key();
+        let inputs: ([u8; 32], Vec<u8>, Vec<u8>, u32, Vec<u8>, Vec<Vec<u8>>) = (vk.to_bytes(), signature.to_vec(), tx_hash, block_number, versioned_hash, blob);
+        
+        tracing::info!("test");
         let env: ExecutorEnv = ExecutorEnv::builder()
-            .write(&signature_input)
-            .unwrap()
-            .write(&leaf_hash)
-            .unwrap()
-            .write(&merkle_path)
+            .write(&inputs)
             .unwrap()
             .build()
             .unwrap();
 
-        // Obtain the default prover.
-        let session_info = default_executor().execute(env, super::MAIN_ELF).unwrap();
-        // let receipt = default_prover().prove(env, super::MAIN_ELF).unwrap();
-        // receipt.verify(super::MAIN_ID).unwrap();
-
-        // let (journal, post_state_digest, seal) =  run_bonsai(signature_input, leaf_hash, merkle_path)?;
-
-        // let calldata = vec![
-        //     Token::Bytes(journal),
-        //     Token::FixedBytes(post_state_digest.to_vec()),
-        //     Token::Bytes(seal),
-        // ];
-        // let output = hex::encode(ethers::abi::encode(&calldata));
-
-        // // Forge test FFI calls expect hex encoded bytes sent to stdout
-        // print!("{output}");
-        // std::io::stdout()
-        //     .flush()
-        //     .context("failed to flush stdout buffer")?;
-
+        // let session = default_executor().execute(env, super::MAIN_ELF).unwrap();
+        let receipt = default_prover().prove(env, super::MAIN_ELF).unwrap();
+        receipt.verify(super::MAIN_ID).unwrap();
+        
         Ok(())
     }
 }
