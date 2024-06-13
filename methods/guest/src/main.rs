@@ -68,7 +68,7 @@ fn main() {
         black_box(signature),
     ));
 
-    env::commit(&(encoded_verifying_key, commitment, blob_hash));
+    env::commit(&(encoded_verifying_key, signature_bytes, blob_hash));
 
     let diff = env::cycle_count();
     env::log(&format!("total cycle count: {}", diff - start));
