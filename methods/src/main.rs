@@ -2,7 +2,6 @@ use bytemuck::cast_slice;
 use risc0_zkvm::{compute_image_id, serde::to_vec, Receipt};
 
 use sha3::{Keccak256, Digest};
-use sha2::{Sha256};
 
 use anyhow::Context;
 use ethers::abi::Token;
@@ -10,37 +9,23 @@ use std::io::Write;
 
 use alloy_primitives::FixedBytes;
 
-use risc0_ethereum_contracts::groth16::Seal;
 use std::time::Duration;
 
 use methods::{MAIN_ELF, MAIN_ID};
 
 use bonsai_sdk::alpha as bonsai_sdk;
 
-use ed25519_dalek::{Signature, Signer, SigningKey};
-use rand::rngs::OsRng;
+use risc0_ethereum_contracts::groth16::abi_encode;
 
-fn versioned_hash(data: Vec<Vec<u8>>) -> Vec<u8> {
-    let mut hasher = Sha256::new();
+use k256::{
+    ecdsa::{Signature, SigningKey, signature::Signer},
+    EncodedPoint,
+};
 
-    // Iterate over the vector of vectors, updating the hash for each inner vector
-    for bytes in data {
-        hasher.update(bytes);
-    }
-
-    // Finalize the hash
-    let mut result = hasher.finalize().to_vec();
-
-    // Modify the first byte of the hash
-    if !result.is_empty() {
-        result[0] = 0x01;
-    }
-
-    result
-}
+use hex_literal::hex;
 
 fn run_bonsai(
-    inputs: ([u8; 32], Vec<u8>, Vec<u8>, u32, Vec<u8>, Vec<Vec<u8>>),
+    inputs: (EncodedPoint, Signature, Vec<u8>, Vec<u8>, Vec<Vec<u8>>),
 ) -> Result<(Vec<u8>, FixedBytes<32>, Vec<u8>), anyhow::Error> {
     let client = bonsai_sdk::Client::from_env(risc0_zkvm::VERSION)?;
 
@@ -132,7 +117,7 @@ fn run_stark2snark(
     let snark = snark_receipt.snark;
     tracing::info!("Snark proof!: {snark:?}");
 
-    let seal = Seal::abi_encode(snark).context("Read seal")?;
+    let seal = abi_encode(snark.to_vec()).context("Read seal")?;
     let post_state_digest: FixedBytes<32> = snark_receipt
         .post_state_digest
         .as_slice()
@@ -143,37 +128,41 @@ fn run_stark2snark(
     Ok((journal, post_state_digest, seal))
 }
 
+
 fn main() -> Result<(), anyhow::Error> {
-    let mut blob: Vec<Vec<u8>> = Vec::new();
+   
+    let mut sequenced_data: Vec<Vec<u8>> = Vec::new();
     // for mock purposes transactions are exactly 32 bytes long and 4096 transactions fit in a blob
-    for i in 0..4096 {
-        let tx: Vec<u8> = vec![i as u8; 32];
-        blob.push(tx);
+    for i in 1..50 {
+        let tx: Vec<u8> = vec![i as u8; 96];
+        sequenced_data.push(tx);
     }
 
-    let versioned_hash: Vec<u8> = versioned_hash(blob.clone());
+    // mock. None of the hashes of the mock bytes in the sequence above evaluate to 32 zero bytes
+    let tx_hash_non_existent: Vec<u8> = vec![0; 32];
 
-    let tx_non_existent: Vec<u8> = vec![0; 64]; // mock. will not result in the same hash as any of the above since the length is different
-
-    let block_number: u32 = 1234; // mock
+    let mut block_number: Vec<u8> = vec![0; 32]; // mock
+    block_number[31] = 5; // mock
 
     let mut hasher = Keccak256::new();
-    hasher.update(&tx_non_existent);
-    let tx_hash: Vec<u8> = hasher.finalize().to_vec();
+    hasher.update(&tx_hash_non_existent);
+    hasher.update(&block_number);
+    let commitment: Vec<u8> = hasher.finalize().to_vec();
 
-    let mut hasher2 = Keccak256::new();
-    hasher2.update(&tx_hash);
-    hasher2.update(&block_number.to_le_bytes());
-    let commitment: Vec<u8> = hasher2.finalize().to_vec();
+    // Generate a secp256k1 keypair and sign the message.
+    let signing_key = SigningKey::from_bytes(&hex!("0000000000000000000000000000000000000000000000000000000000001234").into())?;
 
-    let mut csprng = OsRng {};
-    let keypair: SigningKey = SigningKey::generate(&mut csprng);
-    let signature: Signature = keypair.sign(&commitment);
+    // Sign the commitment
+    let signature: Signature = signing_key.sign(&commitment);
 
+    // Prepare output information
+    let verifying_key = signing_key.verifying_key();
+    let encoded_point = verifying_key.to_encoded_point(true); // Compressed form
+    
+    // You can now use these values as needed
     // tracing::info!("env");
-    let vk = keypair.verifying_key();
-    let inputs: ([u8; 32], Vec<u8>, Vec<u8>, u32, Vec<u8>, Vec<Vec<u8>>) = (vk.to_bytes(), signature.to_vec(), tx_hash, block_number, versioned_hash, blob);
-
+    let inputs: (EncodedPoint, Signature, Vec<u8>, Vec<u8>, Vec<Vec<u8>>) = (encoded_point, signature, tx_hash_non_existent, block_number, sequenced_data);
+    
     let (journal, post_state_digest, seal) =  run_bonsai(inputs)?;
         
     let calldata = vec![
@@ -181,6 +170,7 @@ fn main() -> Result<(), anyhow::Error> {
         Token::FixedBytes(post_state_digest.to_vec()),
         Token::Bytes(seal),
     ];
+
     let output = hex::encode(ethers::abi::encode(&calldata));
 
     // Forge test FFI calls expect hex encoded bytes sent to stdout

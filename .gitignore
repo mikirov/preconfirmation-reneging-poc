@@ -23,3 +23,5 @@ target/
 .idea
 
 receipt*.json
+
+node_modules/

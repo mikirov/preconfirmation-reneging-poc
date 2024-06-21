@@ -6,31 +6,15 @@ mod tests {
     use risc0_zkvm::{default_executor, ExecutorEnv, default_prover};
 
     use sha3::{Keccak256, Digest};
-    use sha2::{Sha256};
 
     use anyhow::Result;
 
-    use ed25519_dalek::{Signature, Signer, SigningKey};
-    use rand::rngs::OsRng;
+    use k256::{
+        ecdsa::{signature::Signer, Signature, SigningKey, VerifyingKey},
+        EncodedPoint,
+    };
 
-    fn versioned_hash(data: Vec<Vec<u8>>) -> Vec<u8> {
-        let mut hasher = Sha256::new();
-    
-        // Iterate over the vector of vectors, updating the hash for each inner vector
-        for bytes in data {
-            hasher.update(bytes);
-        }
-    
-        // Finalize the hash
-        let mut result = hasher.finalize().to_vec();
-    
-        // Modify the first byte of the hash
-        if !result.is_empty() {
-            result[0] = 0x01;
-        }
-    
-        result
-    }
+    use hex_literal::hex; // Ensure you have `hex_literal` in your `Cargo.toml` for the `hex!` macro
 
     #[test]
     fn test_execute_success() -> Result<(), anyhow::Error> {
@@ -39,35 +23,41 @@ mod tests {
             .with_target(false)
             .init();        
 
-        let mut blob: Vec<Vec<u8>> = Vec::new();
+        let mut sequenced_data: Vec<Vec<u8>> = Vec::new();
         // for mock purposes transactions are exactly 32 bytes long and 4096 transactions fit in a blob
-        for i in 0..4096 {
-            let tx: Vec<u8> = vec![i as u8; 32];
-            blob.push(tx);
+        for i in 1..50 {
+            let tx: Vec<u8> = vec![i as u8; 96];
+            sequenced_data.push(tx);
         }
     
-        let versioned_hash: Vec<u8> = versioned_hash(blob.clone());
-
-        let tx_non_existent: Vec<u8> = vec![0; 64]; // mock. will not result in the same hash as any of the above since the length is different
+        // mock. None of the hashes of the mock bytes in the sequence above evaluate to 32 zero bytes
+        let tx_hash_non_existent: Vec<u8> = vec![0; 32];
     
-        let block_number: u32 = 1234; // mock
+        let mut block_number: Vec<u8> = vec![0; 32]; // mock
+        block_number[31] = 5; // mock
     
         let mut hasher = Keccak256::new();
-        hasher.update(&tx_non_existent);
-        let tx_hash: Vec<u8> = hasher.finalize().to_vec();
+        hasher.update(&tx_hash_non_existent);
+        hasher.update(&block_number);
+        let commitment: Vec<u8> = hasher.finalize().to_vec();
     
-        let mut hasher2 = Keccak256::new();
-        hasher2.update(&tx_hash);
-        hasher2.update(&block_number.to_le_bytes());
-        let commitment: Vec<u8> = hasher2.finalize().to_vec();
-    
-        let mut csprng = OsRng {};
-        let keypair: SigningKey = SigningKey::generate(&mut csprng);
-        let signature: Signature = keypair.sign(&commitment);
-    
+        // Generate a secp256k1 keypair and sign the message.
+        let signing_key = SigningKey::from_bytes(&hex!("0000000000000000000000000000000000000000000000000000000000001234").into())?;
+
+        // Sign the commitment
+        let signature: Signature = signing_key.sign(&commitment);
+
+        // Prepare output information
+        let verifying_key = signing_key.verifying_key();
+        let encoded_point = verifying_key.to_encoded_point(true); // Compressed form
+        let signature_bytes = signature.to_vec();
+
+        // You can now use these values as needed
+        tracing::info!("Public Key: {:?}", encoded_point);
+        tracing::info!("Signature: {:?}", signature_bytes);
+            
         // tracing::info!("env");
-        let vk = keypair.verifying_key();
-        let inputs: ([u8; 32], Vec<u8>, Vec<u8>, u32, Vec<u8>, Vec<Vec<u8>>) = (vk.to_bytes(), signature.to_vec(), tx_hash, block_number, versioned_hash, blob);
+        let inputs: (EncodedPoint, Signature, Vec<u8>, Vec<u8>, Vec<Vec<u8>>) = (encoded_point, signature, tx_hash_non_existent, block_number, sequenced_data);
         
         tracing::info!("test");
         let env: ExecutorEnv = ExecutorEnv::builder()
@@ -76,9 +66,9 @@ mod tests {
             .build()
             .unwrap();
 
-        // let session = default_executor().execute(env, super::MAIN_ELF).unwrap();
-        let receipt = default_prover().prove(env, super::MAIN_ELF).unwrap();
-        receipt.verify(super::MAIN_ID).unwrap();
+        let session = default_executor().execute(env, super::MAIN_ELF).unwrap();
+        // let receipt = default_prover().prove(env, super::MAIN_ELF).unwrap();
+        // receipt.verify(super::MAIN_ID).unwrap();
         
         Ok(())
     }

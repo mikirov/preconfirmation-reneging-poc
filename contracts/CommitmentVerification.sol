@@ -39,7 +39,7 @@ contract CommitmentVerification {
         verifier = _verifier;
     }
 
-    function verify(bytes memory journal, bytes32 postStateDigest, bytes calldata seal) public returns (bool){
-        require(verifier.verify(seal, imageId, postStateDigest, sha256(journal)), "verification failed");   
+    function verify(bytes32 publicInputHash, bytes32 postStateDigest, bytes calldata seal) public returns (bool){
+        require(verifier.verify(seal, imageId, postStateDigest, publicInputHash), "verification failed");   
     }
 }
